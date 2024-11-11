@@ -34,3 +34,11 @@ def split_evenly(num_total: int, num_splits: int) -> List[int]:
         num_per[idx] += 1
 
     return num_per
+
+def sample_weight_generator(num_states):
+    weights = [1/num_states for _ in range(num_states)]
+    weights[0] = 0.15
+    return weights
+
+def get_time_alpha(initial, ending, num_epochs, epoch):
+    return initial + (ending - initial)/num_epochs * epoch

@@ -1,0 +1,11 @@
+# 运行t的初始训练
+python ./train/train_t.py --t_model_dir ./saved_models/cube3/current --results_dir ./train/t_results/
+
+#运行gamma的初始训练
+python ./train/train_gamma.py --gamma_model_dir ./saved_models/cube3/current --results_dir ./train/gamma_results/
+
+# 运行gamma的后续训练， 注意改init_epoch
+python ./train/train_gamma.py --gamma_model_dir ./train/gamma_final_result --results_dir ./train/gamma_results/
+
+# 运行test数据的astar搜索
+python ./search_methods/astar.py --gamma_model_dir ./train/gamma_final_result --t_model_dir ./train/t_final_results --results_dir ./search_methods/search_results/

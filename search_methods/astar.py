@@ -1,18 +1,23 @@
+import sys
+sys.path.append('./')
+
 from typing import List, Tuple, Dict, Callable, Optional, Any
 from environments.environment_abstract import Environment, State
 import numpy as np
 from heapq import heappush, heappop
+import heapq
 from subprocess import Popen, PIPE
+import pandas as pd
 
 from argparse import ArgumentParser
 import torch
-from utils import env_utils, nnet_utils, search_utils, misc_utils, data_utils
-import pickle
+from utils import env_utils, nnet_utils, search_utils, misc_utils
 import time
-import sys
 import os
 import socket
 from torch.multiprocessing import Process
+
+
 
 
 class Node:
@@ -32,7 +37,7 @@ class Node:
         self.transition_costs: List[float] = []
         self.children: List[Node] = []
 
-        self.bellman: float = np.inf
+        self.bellman: float = torch.inf
 
     def compute_bellman(self):
         if self.is_solved:
@@ -66,16 +71,36 @@ class Instance:
             heappush(self.open_set, (node.cost, self.heappush_count, node))
             self.heappush_count += 1
 
-    def pop_from_open(self, num_nodes: int) -> List[Node]:
-        num_to_pop: int = min(num_nodes, len(self.open_set))
+    def pop_from_open(self, num_nodes: int, target_state: Optional[State] = None) -> List[Node]:
+        if target_state is not None:
 
-        popped_nodes = [heappop(self.open_set)[2] for _ in range(num_to_pop)]
-        self.goal_nodes.extend([node for node in popped_nodes if node.is_solved])
-        self.popped_nodes.extend(popped_nodes)
+            index = None
+            for i, (cost, count, node) in enumerate(self.open_set):
+                if node.state == target_state:
+                    index = i
+                    break
+            if index is not None:
 
-        return popped_nodes
+                node = self.open_set[index][2]
+                self.open_set[index] = self.open_set[-1]
+                self.open_set.pop()
+                if index < len(self.open_set):
+                    heapq._siftup(self.open_set, index)
+                    heapq._siftdown(self.open_set, 0, index)
+                if node.is_solved:
+                    self.goal_nodes.append(node)
+                self.popped_nodes.append(node)
+                return [node]
+            else:
+                raise ValueError("Target node not found in open set")
+        else:
+            num_to_pop: int = min(num_nodes, len(self.open_set))
+            popped_nodes = [heappop(self.open_set)[2] for _ in range(num_to_pop)]
+            self.goal_nodes.extend([node for node in popped_nodes if node.is_solved])
+            self.popped_nodes.extend(popped_nodes)
+            return popped_nodes
 
-    def remove_in_closed(self, nodes: List[Node]) -> List[Node]:
+    def remove_in_closed(self, nodes: List[Node], target_state=None) -> List[Node]:
         nodes_not_in_closed: List[Node] = []
 
         for node in nodes:
@@ -86,13 +111,18 @@ class Instance:
             elif path_cost_prev > node.path_cost:
                 nodes_not_in_closed.append(node)
                 self.closed_dict[node.state] = node.path_cost
+            elif target_state and node.state == target_state:
+                nodes_not_in_closed.append(node)
+                self.closed_dict[node.state] = node.path_cost
 
         return nodes_not_in_closed
 
 
-def pop_from_open(instances: List[Instance], batch_size: int) -> List[List[Node]]:
-    popped_nodes_all: List[List[Node]] = [instance.pop_from_open(batch_size) for instance in instances]
-
+def pop_from_open(instances: List[Instance], batch_size: int, target_state: Optional[State] = None) -> List[List[Node]]:
+    popped_nodes_all: List[List[Node]] = []
+    for instance in instances:
+        popped_nodes = instance.pop_from_open(batch_size, target_state=target_state)
+        popped_nodes_all.append(popped_nodes)
     return popped_nodes_all
 
 
@@ -170,30 +200,32 @@ def expand_nodes(instances: List[Instance], popped_nodes_all: List[List[Node]], 
     return nodes_c_by_inst
 
 
-def remove_in_closed(instances: List[Instance], nodes_c_all: List[List[Node]]) -> List[List[Node]]:
+def remove_in_closed(instances: List[Instance], nodes_c_all: List[List[Node]], target_state=None) -> List[List[Node]]:
     for inst_idx, instance in enumerate(instances):
-        nodes_c_all[inst_idx] = instance.remove_in_closed(nodes_c_all[inst_idx])
+        nodes_c_all[inst_idx] = instance.remove_in_closed(nodes_c_all[inst_idx], target_state=target_state)
 
     return nodes_c_all
 
 
 def add_heuristic_and_cost(nodes: List[Node], heuristic_fn: Callable,
-                           weights: List[float]) -> Tuple[np.ndarray, np.ndarray]:
+                           weights: List[float], device="cuda:0") -> Tuple[np.ndarray, np.ndarray]:
+
     # flatten nodes
     nodes: List[Node]
 
     if len(nodes) == 0:
-        return np.zeros(0), np.zeros(0)
+        return torch.zeros(0), torch.zeros(0, device=device)
 
     # get heuristic
     states: List[State] = [node.state for node in nodes]
 
     # compute node cost
     heuristics = heuristic_fn(states)
-    path_costs: np.ndarray = np.array([node.path_cost for node in nodes])
-    is_solved: np.ndarray = np.array([node.is_solved for node in nodes])
 
-    costs: np.ndarray = np.array(weights) * path_costs + heuristics * np.logical_not(is_solved)
+    path_costs = torch.tensor([node.path_cost for node in nodes], device=device)
+    is_solved = torch.tensor([node.is_solved for node in nodes], device=device)
+
+    costs = torch.tensor(weights, device=device) * path_costs + heuristics * torch.logical_not(is_solved).to(device)
 
     # add cost to node
     for node, heuristic, cost in zip(nodes, heuristics, costs):
@@ -231,27 +263,41 @@ def get_path(node: Node) -> Tuple[List[State], List[int], float]:
 
 class AStar:
 
-    def __init__(self, states: List[State], env: Environment, heuristic_fn: Callable, weights: List[float]):
+    def __init__(self, states: List[State], env: Environment, heuristic_fn: Callable, weights: List[float], known_solution_moves: List[int] = None, device = 'cuda:0'):
         self.env: Environment = env
         self.weights: List[float] = weights
         self.step_num: int = 0
+        self.device = device
 
         self.timings: Dict[str, float] = {"pop": 0.0, "expand": 0.0, "check": 0.0, "heur": 0.0,
                                           "add": 0.0, "itr": 0.0}
 
         # compute starting costs
         root_nodes: List[Node] = []
-        is_solved_states: np.ndarray = self.env.is_solved(states)
+        is_solved_states = self.env.is_solved(states)
         for state, is_solved in zip(states, is_solved_states):
             root_node: Node = Node(state, 0.0, is_solved, None, None)
             root_nodes.append(root_node)
 
-        add_heuristic_and_cost(root_nodes, heuristic_fn, self.weights)
+        add_heuristic_and_cost(root_nodes, heuristic_fn, self.weights, device=device)
 
         # initialize instances
         self.instances: List[Instance] = []
         for root_node in root_nodes:
             self.instances.append(Instance(root_node))
+
+
+        self.known_solution_states = None
+        if known_solution_moves:
+
+            self.known_solution_states: List[State] = [states[0]]  # 起始状态
+            current_state = states[0]
+            for move in known_solution_moves:
+                next_states, _ = env.next_state([current_state], move)
+                current_state = next_states[0]
+                self.known_solution_states.append(current_state)
+            self.known_solution_states.append(None)
+            self.solution_index = 0
 
     def step(self, heuristic_fn: Callable, batch_size: int, include_solved: bool = False, verbose: bool = False):
         start_time_itr = time.time()
@@ -263,7 +309,11 @@ class AStar:
 
         # Pop from open
         start_time = time.time()
-        popped_nodes_all: List[List[Node]] = pop_from_open(instances, batch_size)
+
+        target_state = self.known_solution_states[self.solution_index] if self.known_solution_states else None
+        if self.known_solution_states:
+            self.solution_index += 1
+        popped_nodes_all: List[List[Node]] = pop_from_open(instances, batch_size, target_state=target_state)
         pop_time = time.time() - start_time
 
         # Expand nodes
@@ -280,7 +330,8 @@ class AStar:
 
         # Check if children are in closed
         start_time = time.time()
-        nodes_c_all = remove_in_closed(instances, nodes_c_all)
+        target_state = self.known_solution_states[self.solution_index] if self.known_solution_states else None
+        nodes_c_all = remove_in_closed(instances, nodes_c_all, target_state=target_state)
         check_time = time.time() - start_time
 
         # Add to open
@@ -289,6 +340,8 @@ class AStar:
         add_time = time.time() - start_time
 
         itr_time = time.time() - start_time_itr
+
+
 
         # Print to screen
         if verbose:
@@ -315,6 +368,8 @@ class AStar:
         self.timings['itr'] += itr_time
 
         self.step_num += 1
+
+        return
 
     def has_found_goal(self) -> List[bool]:
         goal_found: List[bool] = [len(self.get_goal_nodes(idx)) > 0 for idx in range(len(self.instances))]
@@ -343,14 +398,16 @@ class AStar:
 def main():
     # parse arguments
     parser: ArgumentParser = ArgumentParser()
-    parser.add_argument('--states', type=str, required=True, help="File containing states to solve")
-    parser.add_argument('--model_dir', type=str, required=True, help="Directory of nnet model")
-    parser.add_argument('--env', type=str, required=True, help="Environment: cube3, 15-puzzle, 24-puzzle")
+    parser.add_argument('--gamma_model_dir', type=str, required=True, help="Directory of gamma model")
+    parser.add_argument('--t_model_dir', type=str, required=True, help="Directory of t model")
+    parser.add_argument('--results_dir', type=str, required=True, help="Directory of search results")
+
+
+    parser.add_argument('--env', type=str, default='cube3', help="Environment: cube3")
     parser.add_argument('--batch_size', type=int, default=1, help="Batch size for BWAS")
     parser.add_argument('--weight', type=float, default=1.0, help="Weight of path cost")
     parser.add_argument('--language', type=str, default="python", help="python or cpp")
 
-    parser.add_argument('--results_dir', type=str, required=True, help="Directory to save results")
     parser.add_argument('--start_idx', type=int, default=0, help="")
     parser.add_argument('--nnet_batch_size', type=int, default=None, help="Set to control how many states per GPU are "
                                                                           "evaluated by the neural network at a time. "
@@ -363,38 +420,96 @@ def main():
 
     args = parser.parse_args()
 
-    if not os.path.exists(args.results_dir):
-        os.makedirs(args.results_dir)
 
-    results_file: str = "%s/results.pkl" % args.results_dir
-    output_file: str = "%s/output.txt" % args.results_dir
-    if not args.debug:
-        sys.stdout = data_utils.Logger(output_file, "w")
-
-    # get data
-    input_data = pickle.load(open(args.states, "rb"))
-    states: List[State] = input_data['states'][args.start_idx:]
 
     # environment
     env: Environment = env_utils.get_environment(args.env)
+
+
+    # get data   
+    datas_test = pd.read_csv('./data/cube3/test.csv')['scramble']
+    datas_train = pd.read_csv('./data/cube3/train.csv')
+    states_list = []
+    for i in range(len(datas_test)):
+        data = datas_test.iloc[i]
+        moves = [int(_) for _ in data.split(' ')]
+        state = env.scramble(moves)
+        states_list.append(state)
+    states: List[State] = states_list[args.start_idx:]
+
 
     # initialize results
     results: Dict[str, Any] = dict()
     results["states"] = states
 
-    if args.language == "python":
-        solns, paths, times, num_nodes_gen = bwas_python(args, env, states)
-    elif args.language == "cpp":
-        solns, paths, times, num_nodes_gen = bwas_cpp(args, env, states, results_file)
-    else:
-        raise ValueError("Unknown language %s" % args.language)
+    with torch.no_grad():
+        if args.language == "python":
+            solns, times, steps = bwas_python(args, env, states)
 
-    results["solutions"] = solns
-    results["paths"] = paths
-    results["times"] = times
-    results["num_nodes_generated"] = num_nodes_gen
+    # get loop net
+    device, _, _ = nnet_utils.get_device()
+    
+    loop_dict = [1, 0,  2,
+            4,  3,  5,
+            7,  6,  8, 
+            10, 9,  11, 
+            13, 12, 14, 
+            16, 15, 17, 
+            19, 18, 20, 
+            22, 21, 23, 
+            25, 24, 26]
 
-    pickle.dump(results, open(results_file, "wb"), protocol=-1)
+    loop_policy = torch.zeros(28).to(device)
+    sample_num = 0
+    for i in range(len(datas_train)):
+        data = datas_train.iloc[i]
+        scramble_moves = data['scramble'].split(' ')
+        known_solution_moves = data['recover'].split(' ')
+
+        scramble_moves = [int(i) for i in scramble_moves]
+        known_solution_moves = [int(i) for i in known_solution_moves]
+
+        tem_state = [env.scramble(scramble_moves)]
+
+        for j in range(len(known_solution_moves) - 1):
+            move1, move2 = known_solution_moves[j], known_solution_moves[j+1]
+            if loop_dict[move1] == move2:
+                loop_policy[move1] += 1.0
+            else:
+                loop_policy[-1] += 1.0
+            sample_num += 1
+            
+            tem_state, _ = env.next_state(tem_state, move1)
+    loop_policy = loop_policy / sample_num
+    
+    solns_new = []
+    for i in range(len(solns)):
+        soln_new = []
+        tem_state = [states[i]]
+        for move in solns[i]:
+            while True:
+                picked_actions = int(torch.distributions.Categorical(loop_policy).sample())
+                if picked_actions != 27:
+                    soln_new.append(picked_actions)
+                    soln_new.append(loop_dict[picked_actions])
+                    steps[i] += 2
+                else:
+                    break
+            soln_new.append(move)
+            tem_state, _ = env.next_state(tem_state, move)
+        solns_new.append(soln_new)
+
+
+
+    results["solutions"] = solns_new
+    results["times"] = times.tolist()
+    results["steps"] = steps
+    print(results)
+
+    results_df = pd.DataFrame(results)
+    results_csv_path = os.path.join(args.results_dir, 'search_results.csv')
+    results_df.to_csv(results_csv_path, index=False)
+    print(f'Search records saved to {results_csv_path}')
 
 
 def bwas_python(args, env: Environment, states: List[State]):
@@ -405,237 +520,41 @@ def bwas_python(args, env: Environment, states: List[State]):
 
     print("device: %s, devices: %s, on_gpu: %s" % (device, devices, on_gpu))
 
-    heuristic_fn = nnet_utils.load_heuristic_fn(args.model_dir, device, on_gpu, env.get_nnet_model(),
+    gamma_heuristic_fn = nnet_utils.load_heuristic_fn(args.gamma_model_dir, device, on_gpu, env.get_nnet_model(),
                                                 env, clip_zero=True, batch_size=args.nnet_batch_size)
+    
+    t_heuristic_fn = nnet_utils.load_heuristic_fn(args.t_model_dir, device, on_gpu, env.get_nnet_model(output_t=True),
+                                                env, clip_zero=True, batch_size=args.nnet_batch_size, output_t=True)
 
     solns: List[List[int]] = []
-    paths: List[List[State]] = []
-    times: List = []
-    num_nodes_gen: List[int] = []
+    times: List[float] = []
+    steps: List[int] = []
+
+    times = t_heuristic_fn(states)
 
     for state_idx, state in enumerate(states):
-        start_time = time.time()
 
         num_itrs: int = 0
-        astar = AStar([state], env, heuristic_fn, [args.weight])
+        astar = AStar([state], env, gamma_heuristic_fn, [args.weight])
         while not min(astar.has_found_goal()):
-            astar.step(heuristic_fn, args.batch_size, verbose=args.verbose)
+            astar.step(gamma_heuristic_fn, args.batch_size, verbose=args.verbose)
             num_itrs += 1
 
-        path: List[State]
+
         soln: List[int]
-        path_cost: float
-        num_nodes_gen_idx: int
+
         goal_node: Node = astar.get_goal_node_smallest_path_cost(0)
-        path, soln, path_cost = get_path(goal_node)
-
-        num_nodes_gen_idx: int = astar.get_num_nodes_generated(0)
-
-        solve_time = time.time() - start_time
+        _, soln, _ = get_path(goal_node)
 
         # record solution information
         solns.append(soln)
-        paths.append(path)
-        times.append(solve_time)
-        num_nodes_gen.append(num_nodes_gen_idx)
 
         # check soln
         assert search_utils.is_valid_soln(state, soln, env)
 
-        # print to screen
-        timing_str = ", ".join(["%s: %.2f" % (key, val) for key, val in astar.timings.items()])
-        print("Times - %s, num_itrs: %i" % (timing_str, num_itrs))
+        steps.append(len(soln))
 
-        print("State: %i, SolnCost: %.2f, # Moves: %i, "
-              "# Nodes Gen: %s, Time: %.2f" % (state_idx, path_cost, len(soln),
-                                               format(num_nodes_gen_idx, ","),
-                                               solve_time))
-
-    return solns, paths, times, num_nodes_gen
-
-
-def bwas_cpp(args, env: Environment, states: List[State], results_file: str):
-    assert (args.env.upper() in ['CUBE3', 'CUBE4', 'PUZZLE15', 'PUZZLE24', 'PUZZLE35', 'PUZZLE48', 'LIGHTSOUT7'])
-
-    # Make c++ socket
-    socket_name: str = "%s_cpp_socket" % results_file.split(".")[0]
-
-    try:
-        os.unlink(socket_name)
-    except OSError:
-        if os.path.exists(socket_name):
-            raise
-
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.bind(socket_name)
-
-    # Get state dimension
-    if args.env.upper() == 'CUBE3':
-        state_dim: int = 54
-    elif args.env.upper() == 'PUZZLE15':
-        state_dim: int = 16
-    elif args.env.upper() == 'PUZZLE24':
-        state_dim: int = 25
-    elif args.env.upper() == 'PUZZLE35':
-        state_dim: int = 36
-    elif args.env.upper() == 'PUZZLE48':
-        state_dim: int = 49
-    elif args.env.upper() == 'LIGHTSOUT7':
-        state_dim: int = 49
-    else:
-        raise ValueError("Unknown c++ environment: %s" % args.env)
-
-    # start heuristic proc
-    num_parallel: int = len(os.environ['CUDA_VISIBLE_DEVICES'].split(","))
-    device, devices, on_gpu = nnet_utils.get_device()
-    heur_fn_i_q, heur_fn_o_qs, heur_procs = nnet_utils.start_heur_fn_runners(num_parallel, args.model_dir, device,
-                                                                             on_gpu, env, all_zeros=False,
-                                                                             clip_zero=True,
-                                                                             batch_size=args.nnet_batch_size)
-    nnet_utils.heuristic_fn_par(states, env, heur_fn_i_q, heur_fn_o_qs)  # initialize
-
-    heur_proc = Process(target=cpp_listener, args=(sock, args, env, state_dim, heur_fn_i_q, heur_fn_o_qs))
-    heur_proc.daemon = True
-    heur_proc.start()
-
-    time.sleep(2)  # give socket time to intialize
-
-    solns: List[List[int]] = []
-    paths: List[List[State]] = []
-    times: List = []
-    num_nodes_gen: List[int] = []
-
-    for state_idx, state in enumerate(states):
-        # Get string rep of state
-        if args.env.upper() == "CUBE3":
-            state_str: str = " ".join([str(x) for x in state.colors])
-        elif args.env.upper() in ["PUZZLE15", "PUZZLE24", "PUZZLE35", "PUZZLE48"]:
-            state_str: str = " ".join([str(x) for x in state.tiles])
-        elif args.env.upper() in ["LIGHTSOUT7"]:
-            state_str: str = " ".join([str(x) for x in state.tiles])
-        else:
-            raise ValueError("Unknown c++ environment: %s" % args.env)
-
-        popen = Popen(['./cpp/parallel_weighted_astar', state_str, str(args.weight), str(args.batch_size),
-                       socket_name, args.env, "0"], stdout=PIPE, stderr=PIPE, bufsize=1, universal_newlines=True)
-        lines = []
-        for stdout_line in iter(popen.stdout.readline, ""):
-            stdout_line = stdout_line.strip('\n')
-            lines.append(stdout_line)
-            if args.verbose:
-                sys.stdout.write("%s\n" % stdout_line)
-                sys.stdout.flush()
-
-        moves = [int(x) for x in lines[-5].split(" ")[:-1]]
-        soln = [x for x in moves][::-1]
-        num_nodes_gen_idx = int(lines[-3])
-        solve_time = float(lines[-1])
-
-        # record solution information
-        path: List[State] = [state]
-        next_state: State = state
-        transition_costs: List[float] = []
-
-        for move in soln:
-            next_states, tcs = env.next_state([next_state], move)
-
-            next_state = next_states[0]
-            tc = tcs[0]
-
-            path.append(next_state)
-            transition_costs.append(tc)
-
-        solns.append(soln)
-        paths.append(path)
-        times.append(solve_time)
-        num_nodes_gen.append(num_nodes_gen_idx)
-
-        path_cost: float = sum(transition_costs)
-
-        # check soln
-        assert search_utils.is_valid_soln(state, soln, env)
-
-        # print to screen
-        print("State: %i, SolnCost: %.2f, # Moves: %i, "
-              "# Nodes Gen: %s, Time: %.2f" % (state_idx, path_cost, len(soln),
-                                               format(num_nodes_gen_idx, ","),
-                                               solve_time))
-
-    os.unlink(socket_name)
-
-    nnet_utils.stop_heuristic_fn_runners(heur_procs, heur_fn_i_q)
-
-    return solns, paths, times, num_nodes_gen
-
-
-def cpp_listener(sock, args, env: Environment, state_dim: int, heur_fn_i_q, heur_fn_o_qs):
-    sock.listen(1)
-    connection, client_address = sock.accept()
-
-    # device, devices, on_gpu = nnet_utils.get_device()
-    # heuristic_fn = nnet_utils.load_heuristic_fn(args.model_dir, device, on_gpu, env.get_nnet_model(),
-    #                                             env, clip_zero=True, batch_size=args.nnet_batch_size)
-
-    max_bytes: int = 4096
-    while True:
-        data_rec = connection.recv(8)
-        while not data_rec:
-            connection, client_address = sock.accept()
-            data_rec = connection.recv(8)
-
-        num_bytes_recv = np.frombuffer(data_rec, dtype=np.int64)[0]
-
-        num_bytes_seen = 0
-        data_rec = b""
-        while num_bytes_seen < num_bytes_recv:
-            con_rec = connection.recv(max_bytes)
-            data_rec = data_rec + con_rec
-            num_bytes_seen = num_bytes_seen + len(con_rec)
-
-        states_np = np.frombuffer(data_rec, dtype=env.dtype)
-        states_np = states_np.reshape(int(len(states_np)/state_dim), state_dim)
-
-        # Get nnet representation of state
-        if args.env.upper() == "CUBE3":
-            states_np = states_np/9
-            states_np = states_np.astype(env.dtype)
-            states_nnet: List[np.ndarray] = [states_np]
-        elif args.env.upper() in ["PUZZLE15", "PUZZLE24", "PUZZLE35", "PUZZLE48"]:
-            states_np = states_np.astype(env.dtype)
-            states_nnet: List[np.ndarray] = [states_np]
-        elif args.env.upper() in ["LIGHTSOUT7"]:
-            states_np = states_np.astype(env.dtype)
-            states_nnet: List[np.ndarray] = [states_np]
-        else:
-            raise ValueError("Unknown c++ environment %s" % args.env)
-
-        # get heuristic
-        results = heuristic_fn_par(states_nnet, heur_fn_i_q, heur_fn_o_qs)
-
-        # send results
-        connection.sendall(results.astype(np.float32))
-
-
-def heuristic_fn_par(states_nnet: List[np.ndarray], heur_fn_i_q, heur_fn_o_qs):
-    num_parallel: int = len(heur_fn_o_qs)
-
-    num_states: int = states_nnet[0].shape[0]
-
-    parallel_nums = range(min(num_parallel, num_states))
-    split_idxs = np.array_split(np.arange(num_states), len(parallel_nums))
-    for idx in parallel_nums:
-        states_nnet_idx = [x[split_idxs[idx]] for x in states_nnet]
-        heur_fn_i_q.put((idx, states_nnet_idx))
-
-    # Check until all data is obtaied
-    results = [None]*len(parallel_nums)
-    for idx in parallel_nums:
-        results[idx] = heur_fn_o_qs[idx].get()
-
-    results = np.concatenate(results, axis=0)
-
-    return results
-
+    return solns, times, steps
 
 if __name__ == "__main__":
     main()

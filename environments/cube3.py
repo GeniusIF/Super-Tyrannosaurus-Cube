@@ -3,7 +3,8 @@ import numpy as np
 from torch import nn
 from random import randrange
 
-from utils.pytorch_models import ResnetModel
+from utils.nnet_gamma import GammaModel
+from utils.nnet_t import TModel
 from .environment_abstract import Environment, State
 
 
@@ -25,8 +26,8 @@ class Cube3State(State):
 
 
 class Cube3(Environment):
-    moves: List[str] = ["%s%i" % (f, n) for f in ['U', 'D', 'L', 'R', 'B', 'F'] for n in [-1, 1]]
-    moves_rev: List[str] = ["%s%i" % (f, n) for f in ['U', 'D', 'L', 'R', 'B', 'F'] for n in [1, -1]]
+    moves: List[str] = ["%s%i" % (f, n) for f in ['U', 'D', 'L', 'R', 'B', 'F', 'M', 'S', 'E'] for n in [-1, 1, 2]]
+    moves_rev: List[str] = ["%s%i" % (f, n) for f in ['U', 'D', 'L', 'R', 'B', 'F', 'M', 'S', 'E'] for n in [1, -1, -2]]
 
     def __init__(self):
         super().__init__()
@@ -46,12 +47,54 @@ class Cube3(Environment):
         self.rotate_idxs_new, self.rotate_idxs_old = self._compute_rotation_idxs(self.cube_len, self.moves)
 
     def next_state(self, states: List[Cube3State], action: int) -> Tuple[List[Cube3State], List[float]]:
+        action_str: str = self.moves[action]
+        
+        # Handle M, S, E moves by using alternative moves
+        if action_str in ['M1', 'M-1', 'S1', 'S-1', 'E1', 'E-1']:
+            return self._handle_special_move(states, action_str)
+        
+        # Handle double moves (e.g., U2, D2, ...)
+        elif action_str[-1] == '2':
+            action_str_base = action_str[0] + '1'
+            return self._apply_double_move(states, action_str_base)
+        
         states_np = np.stack([x.colors for x in states], axis=0)
         states_next_np, transition_costs = self._move_np(states_np, action)
 
         states_next: List[Cube3State] = [Cube3State(x) for x in list(states_next_np)]
 
         return states_next, transition_costs
+
+    def scramble(self, moves: List[int]) -> Cube3State:
+
+        current_state = Cube3State(self.goal_colors.copy()) 
+
+        for move in moves:
+
+            next_states, _ = self.next_state([current_state], move)
+            current_state = next_states[0] 
+
+        return current_state
+
+    def _apply_double_move(self, states: List[Cube3State], move: str) -> Tuple[List[Cube3State], List[float]]:
+        # Apply the move twice
+        first_move_states, _ = self.next_state(states, self.moves.index(move))
+        second_move_states, transition_costs = self.next_state(first_move_states, self.moves.index(move))
+        return second_move_states, transition_costs
+    
+    def _handle_special_move(self, states: List[Cube3State], action_str: str) -> Tuple[List[Cube3State], List[float]]:
+        if action_str == 'M1':
+            return self.next_state(self.next_state(states, self.moves.index("L-1"))[0], self.moves.index("R1"))
+        elif action_str == 'M-1':
+            return self.next_state(self.next_state(states, self.moves.index("L1"))[0], self.moves.index("R-1"))
+        elif action_str == 'S1':
+            return self.next_state(self.next_state(states, self.moves.index("F-1"))[0], self.moves.index("B1"))
+        elif action_str == 'S-1':
+            return self.next_state(self.next_state(states, self.moves.index("F1"))[0], self.moves.index("B-1"))
+        elif action_str == 'E1':
+            return self.next_state(self.next_state(states, self.moves.index("U-1"))[0], self.moves.index("D1"))
+        elif action_str == 'E-1':
+            return self.next_state(self.next_state(states, self.moves.index("U1"))[0], self.moves.index("D-1"))    
 
     def prev_state(self, states: List[Cube3State], action: int) -> List[Cube3State]:
         move: str = self.moves[action]
@@ -87,9 +130,12 @@ class Cube3(Environment):
     def get_num_moves(self) -> int:
         return len(self.moves)
 
-    def get_nnet_model(self) -> nn.Module:
+    def get_nnet_model(self, output_t: bool = False) -> nn.Module:
         state_dim: int = (self.cube_len ** 2) * 6
-        nnet = ResnetModel(state_dim, 6, 5000, 1000, 4, 1, True)
+        if not output_t:
+            nnet = GammaModel(state_dim, 6, 5000, 1000, 4, 1, True)
+        else:
+            nnet = TModel(state_dim, 6, 5000, True)
 
         return nnet
 
@@ -163,6 +209,19 @@ class Cube3(Environment):
     def _move_np(self, states_np: np.ndarray, action: int):
         action_str: str = self.moves[action]
 
+        if action_str in ['M1', 'M-1', 'S1', 'S-1', 'E1', 'E-1']:
+
+            next_states, transition_costs = self.next_state([Cube3State(x) for x in states_np], action)
+            states_next_np = np.stack([state.colors for state in next_states], axis=0)
+            return states_next_np, transition_costs
+
+        if action_str[-1] == '2':
+            base_move = action_str[0] + '1' 
+
+            states_np, _ = self._move_np(states_np, self.moves.index(base_move))
+            states_np, transition_costs = self._move_np(states_np, self.moves.index(base_move))
+            return states_np, transition_costs
+
         states_next_np: np.ndarray = states_np.copy()
         states_next_np[:, self.rotate_idxs_new[action_str]] = states_np[:, self.rotate_idxs_old[action_str]]
 
@@ -188,6 +247,9 @@ class Cube3(Environment):
         for move in moves:
             f: str = move[0]
             sign: int = int(move[1:])
+            
+            if f in ['M', 'S', 'E']:
+                continue  
 
             rotate_idxs_new[move] = np.array([], dtype=int)
             rotate_idxs_old[move] = np.array([], dtype=int)

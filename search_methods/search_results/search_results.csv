@@ -1,0 +1,6 @@
+打乱公式,复原公式,时间(ms),步数
+F L2 B' L2 R2 D2 R2 F' R2 B L2 D U' L' R D L' D2 R B2 R,U' F' B' L F2 L D' L' F L D F D F2 D2 F U' D2 B' D' B U D' B' D' B D2 R F D F' R' D2 F' D2 F D F2 U' F D' F' U F2 D F' D' F D F' D D D' F D',6047,55
+F' R2 F' L2 F D2 F' U2 F D2 U' L2 B L' D2 L D2 L' D2 F',F' L' R L' R B' L' D' R D R' D' L D L' D R D' R' D R' D' R D B' L B L' D2 R D' R' D R D' R2 B R B' R D' R' D2 D2 D R D R' D R D R' D2 L R D' R' D L' D,4895,60
+L2 D' L2 U2 R2 B2 D' R2 D' F2 U' B' D2 U' F R F' L U2 B R2,B L U2 L F F' F U2 F2 U2 L' D2 F B' D' F' B D' U' U B' F B' L F' B D B U' F2 D2 F2 U D' U B' U2 F B' U2 F' B U2 B' U' B D' B D B U' F' L2 F B' U2 B U B D' B2 D B D' B2 U B' D B U' B2,5493,71
+L2 R B2 R F2 U2 R U2 F2 L2 D' U F' D L' D2 U' B U' R',B L R' B' D' L2 U D2 L' D' L D L D L' D' R' D R2 D R' D R D' R' F' D F D' L B D B' D L' D' F' B D B' D' F D B D B' D' B D' B' D',5729,51
+D L2 U' B2 D' L2 B2 D' U2 L2 U2 L' B' L2 R U2 F L D' R U2,B' L B U L2 L' L D' L2 U2 L U' L' U L U L U' L' R U' R' U2 R' F2 L2 F L' F' L' F2 R2 U R' U' R U2 R' F R' F' R F' U F U' B U2 F' U F B' U' R' F' U' R U R' F R F D' F U F' D F2 U' F,5823,70
